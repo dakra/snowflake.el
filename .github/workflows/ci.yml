@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  NIX_EMACS_CI_REF: ca88f42462347e8e17859645aa59b156617e98fb
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs_version:
+          - '28.1'
+          - '29.4'
+          - '30.2'
+          - 'snapshot'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Install pinned Emacs
+        env:
+          EMACS_VERSION: ${{ matrix.emacs_version }}
+        run: bash .github/scripts/install-emacs.sh
+
+      - name: Install dependencies
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/dakra/ghostel /tmp/ghostel
+          git -C /tmp/ghostel sparse-checkout set lisp
+          git clone --depth 1 https://github.com/emacs-compat/compat /tmp/compat
+
+      - name: Byte-compile
+        run: make compile GHOSTEL_DIR=/tmp/ghostel/lisp COMPAT_DIR=/tmp/compat
+
+      - name: Test
+        run: make test GHOSTEL_DIR=/tmp/ghostel/lisp COMPAT_DIR=/tmp/compat
+
+  checkdoc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Install pinned Emacs
+        env:
+          EMACS_VERSION: '30.2'
+        run: bash .github/scripts/install-emacs.sh
+
+      - name: Checkdoc
+        run: make checkdoc

@@ -1,5 +1,7 @@
 # snowflake.el
 
+[![CI](https://github.com/dakra/snowflake.el/actions/workflows/ci.yml/badge.svg)](https://github.com/dakra/snowflake.el/actions/workflows/ci.yml)
+
 Write SQL in a `sql-mode` buffer and send it to a
 [Snowflake CLI](https://docs.snowflake.com/en/developer-guide/snowflake-cli/index)
 `snow sql` REPL running in a [Ghostel](https://github.com/dakra/ghostel)
