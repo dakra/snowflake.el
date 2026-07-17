@@ -1,0 +1,67 @@
+#!/bin/sh
+# Stub for the snow CLI used by the snowflake.el test suite.
+# Emits a fixed connection list for `connection list --format json`.
+
+if [ "$1" = "connection" ] && [ "$2" = "list" ]; then
+    # Noise on stderr, like the real CLI's warnings/banners; callers
+    # must not let it corrupt the JSON on stdout.
+    echo "fake-snow: unrelated warning" >&2
+    cat <<'EOF'
+[
+    {"connection_name": "dbb-dev", "parameters": {}, "is_default": false},
+    {"connection_name": "dbb-test", "parameters": {}, "is_default": true},
+    {"connection_name": "dbb-prod", "parameters": {}, "is_default": false}
+]
+EOF
+    exit 0
+fi
+
+if [ "$1" = "sql" ]; then
+    if [ -n "$FAKE_SNOW_FAIL" ]; then
+        echo "Invalid OAuth access token" >&2
+        exit 1
+    fi
+    if [ -n "$FAKE_SNOW_SLEEP" ]; then
+        sleep "$FAKE_SNOW_SLEEP"
+    fi
+    # The -q argument selects the canned result.
+    query=""
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "-q" ]; then query="$2"; shift; fi
+        shift
+    done
+    case "$query" in
+        *"show terse schemas"*)
+            cat <<'EOF'
+[
+    {"created_on": "2026-01-01", "name": "PUBLIC", "database_name": "DB"},
+    {"created_on": "2026-01-01", "name": "REPORTING", "database_name": "DB"}
+]
+EOF
+            ;;
+        *"in schema REPORTING"*)
+            cat <<'EOF'
+[
+    {"created_on": "2026-01-01", "name": "EVENTS", "kind": "TABLE",
+     "database_name": "DB", "schema_name": "REPORTING"}
+]
+EOF
+            ;;
+        *)
+            cat <<'EOF'
+[
+    {"created_on": "2026-01-01", "name": "ORDERS", "kind": "TABLE",
+     "database_name": "DB", "schema_name": "PUBLIC"},
+    {"created_on": "2026-01-01", "name": "CUSTOMERS", "kind": "TABLE",
+     "database_name": "DB", "schema_name": "PUBLIC"},
+    {"created_on": "2026-01-01", "name": "ORDERS_V", "kind": "VIEW",
+     "database_name": "DB", "schema_name": "REPORTING"}
+]
+EOF
+            ;;
+    esac
+    exit 0
+fi
+
+echo "fake-snow: unsupported arguments: $*" >&2
+exit 1
