@@ -34,6 +34,14 @@ formatting all work natively.
   untouched.
 - Multi-line statements are sent via bracketed paste, single lines as
   keystrokes so they enter the REPL history naturally.
+- SQL errors the REPL reports for sent statements are highlighted in
+  the source buffer: compilation errors with a `line L at position P`
+  location get a wave underline on the offending token, other errors
+  underline the whole sent text; the full message is shown in the
+  echo area and as tooltip on the highlight.  Clear with
+  `snowflake-clear-errors` (`C-c C-l`) or by sending again; disable
+  with `snowflake-highlight-errors`, adapt the error detection with
+  `snowflake-error-regexp`.
 - `M-x snowflake-restart` re-runs `snow sql` in the same buffer after
   the CLI exits, e.g. when an auth token expired.
 - `M-x snowflake` transient menu with all commands.
@@ -66,6 +74,7 @@ formatting all work natively.
 | `C-c C-z` | `snowflake-switch-to-repl`     |
 | `C-c C-j` | `snowflake-set-buffer`         |
 | `C-c C-k` | `snowflake-interrupt`          |
+| `C-c C-l` | `snowflake-clear-errors`       |
 
 All send commands accept a prefix argument to also select the REPL
 window, except `snowflake-send-file`, where the prefix argument
@@ -87,6 +96,8 @@ Unbound commands: `snowflake-connect`, `snowflake-restart`,
       snowflake-cli-extra-args nil                ; extra args for `snow sql'
       snowflake-default-connection nil            ; nil = CLI default connection
       snowflake-auto-terminate t                  ; append missing ";"
+      snowflake-highlight-errors t                ; highlight REPL errors in the source
+      snowflake-error-regexp "^\\(?:Error occurred: \\)?\\([0-9]\\{6\\}\\) (\\([0-9A-Z]\\{5\\}\\)): " ; error header
       snowflake-set-sql-product t                 ; switch buffers to the snowflake dialect
       snowflake-completion t                      ; completion at point in the minor mode
       snowflake-completion-fetch-trigger 'connect ; fetch objects on REPL link
@@ -101,6 +112,15 @@ Unbound commands: `snowflake-connect`, `snowflake-restart`,
 
 - For very large scripts prefer `snowflake-send-file` (`C-c C-f`),
   which uses the REPL's `!source` command instead of pasting.
+- Error highlighting maps `line L at position P` locations relative
+  to the first code token of the sent text — leading whitespace and
+  comments don't count, matching how the CLI numbers statement
+  lines.  When several statements are sent at
+  once the CLI reports lines per failing statement, so highlights for
+  any statement but the first can land on the wrong line (the
+  message shown is still correct).  `snowflake-send-string` and
+  `snowflake-send-file` (`!source`) don't highlight at all — their
+  text has no buffer positions to map back to.
 
 ## License
 

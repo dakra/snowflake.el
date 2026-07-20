@@ -120,6 +120,340 @@
     (should (equal (snowflake--prepare-string "select 1\r\n-- done")
                    "select 1\r\n-- done\n;"))))
 
+;;; Error detection
+
+(ert-deftest snowflake-test-parse-errors-line-pos ()
+  (with-temp-buffer
+    (insert " > select 1 fromm t;\n"
+            "001003 (42000): 01b2f927-0000-c952-0000-a86d0032222e: "
+            "SQL compilation error:\n"
+            "syntax error line 2 at position 7 unexpected 'FROMM'.\n"
+            "\n"
+            " > ")
+    (let ((errors (snowflake--parse-errors (point-min) (point-max))))
+      (should (= (length errors) 1))
+      (let ((err (car errors)))
+        (should (= (plist-get err :line) 2))
+        (should (= (plist-get err :pos) 7))
+        (should (string-prefix-p "001003 (42000)" (plist-get err :message)))
+        (should (string-suffix-p "unexpected 'FROMM'."
+                                 (plist-get err :message)))))))
+
+(ert-deftest snowflake-test-parse-errors-real-cli-format ()
+  ;; The interactive CLI prefixes headers with "Error occurred: " and
+  ;; terminates the error with the next prompt, no blank line.
+  (with-temp-buffer
+    (insert " > select * fromm mytable;\n"
+            "\n"
+            "Error occurred: 001003 (42000): "
+            "01c5d78d-0107-79b5-0001-4b263e084a3a: SQL compilation error:\n"
+            "syntax error line 1 at position 9 unexpected 'fromm'.\n"
+            " > ")
+    (let ((errors (snowflake--parse-errors (point-min) (point-max))))
+      (should (= (length errors) 1))
+      (should (= (plist-get (car errors) :line) 1))
+      (should (= (plist-get (car errors) :pos) 9))
+      (should (string-prefix-p "Error occurred: 001003"
+                               (plist-get (car errors) :message)))))
+  ;; CLI chatter like "Error occurred: SQL rendering error" has no
+  ;; "NNNNNN (SQLSTATE):" header and is not an error.
+  (with-temp-buffer
+    (insert "Unknown command: exit\n"
+            "Error occurred: SQL rendering error\n"
+            " > ")
+    (should-not (snowflake--parse-errors (point-min) (point-max)))))
+
+(defconst snowflake-test--wrap-newline
+  (propertize "\n" 'ghostel-wrap t)
+  "A newline as ghostel inserts it when soft-wrapping a long line.")
+
+(ert-deftest snowflake-test-parse-errors-wrapped-location ()
+  ;; The terminal hard-wraps the CLI's long header lines at the
+  ;; window width — even mid-number.  Ghostel marks those newlines
+  ;; with the `ghostel-wrap' property; the location and the message
+  ;; must come out unbroken.
+  (with-temp-buffer
+    (insert "Error occurred: 000904 (42000): "
+            "01c5d797-0107-7a7c-0001-4b263e084a3a: "
+            "SQL compilation error: error line 1 at position 1"
+            snowflake-test--wrap-newline
+            "0\n"
+            "invalid identifier 'FF'\n"
+            " > ")
+    (let ((errors (snowflake--parse-errors (point-min) (point-max))))
+      (should (= (length errors) 1))
+      (should (= (plist-get (car errors) :line) 1))
+      (should (= (plist-get (car errors) :pos) 10))
+      (should (string-match-p "at position 10\ninvalid identifier"
+                              (plist-get (car errors) :message)))))
+  ;; A wrap point inside a word instead of a number.
+  (with-temp-buffer
+    (insert "001003 (42000): x: SQL compilation error:\n"
+            "syntax error line 2 at positio"
+            snowflake-test--wrap-newline
+            "n 7 unexpected 'FROMM'.\n"
+            "\n")
+    (let ((errors (snowflake--parse-errors (point-min) (point-max))))
+      (should (= (length errors) 1))
+      (should (= (plist-get (car errors) :line) 2))
+      (should (= (plist-get (car errors) :pos) 7))))
+  ;; A wrap-continuation line is never an error terminator, even
+  ;; when it happens to look like a prompt.
+  (with-temp-buffer
+    (insert "001003 (42000): x: SQL compilation error:\n"
+            "syntax error line 2 at position 7 unexpected '="
+            snowflake-test--wrap-newline
+            ">'.\n"
+            "\n")
+    (let ((errors (snowflake--parse-errors (point-min) (point-max))))
+      (should (= (length errors) 1))
+      (should (string-suffix-p "unexpected '=>'."
+                               (plist-get (car errors) :message))))))
+
+(ert-deftest snowflake-test-parse-errors-no-location ()
+  ;; Errors without a "line L at position P" location, e.g. a
+  ;; nonexistent table, still carry the full message.
+  (with-temp-buffer
+    (insert "002003 (42S02): 01b2f927-0000: SQL compilation error:\n"
+            "Object 'NOPE' does not exist or not authorized.\n"
+            "\n")
+    (let ((errors (snowflake--parse-errors (point-min) (point-max))))
+      (should (= (length errors) 1))
+      (should-not (plist-get (car errors) :line))
+      (should-not (plist-get (car errors) :pos))
+      (should (string-match-p "does not exist"
+                              (plist-get (car errors) :message))))))
+
+(ert-deftest snowflake-test-parse-errors-multiple ()
+  ;; A second header directly after an error terminates the first.
+  (with-temp-buffer
+    (insert "001003 (42000): x: SQL compilation error:\n"
+            "syntax error line 1 at position 7 unexpected 'FROMM'.\n"
+            "000904 (42000): y: SQL compilation error: "
+            "error line 3 at position 2\n"
+            "invalid identifier 'ZAP'.\n"
+            "\n"
+            " > ")
+    (let ((errors (snowflake--parse-errors (point-min) (point-max))))
+      (should (= (length errors) 2))
+      (should (= (plist-get (car errors) :line) 1))
+      (should (= (plist-get (car errors) :pos) 7))
+      (should (= (plist-get (cadr errors) :line) 3))
+      (should (= (plist-get (cadr errors) :pos) 2))
+      (should (string-match-p "ZAP" (plist-get (cadr errors) :message))))))
+
+(ert-deftest snowflake-test-parse-errors-none ()
+  (with-temp-buffer
+    (insert " > select 1;\n+---+\n| 1 |\n+---+\n1 Row(s) produced.\n > ")
+    (should-not (snowflake--parse-errors (point-min) (point-max)))))
+
+(ert-deftest snowflake-test-parse-errors-incomplete ()
+  ;; An error without terminator is still being printed; it is only
+  ;; returned once the following blank/prompt line arrived.
+  (with-temp-buffer
+    (insert "001003 (42000): x: SQL compilation error:\n"
+            "syntax error line 1 at position 7")
+    (should-not (snowflake--parse-errors (point-min) (point-max)))
+    (goto-char (point-max))
+    (insert "\n\n > ")
+    (let ((errors (snowflake--parse-errors (point-min) (point-max))))
+      (should (= (length errors) 1))
+      (should (= (plist-get (car errors) :pos) 7)))))
+
+(ert-deftest snowflake-test-parse-errors-end-positions ()
+  ;; :end lets the caller advance the scan start past reported errors.
+  (with-temp-buffer
+    (insert "001003 (42000): x: SQL compilation error:\n"
+            "syntax error line 1 at position 0 unexpected 'X'.\n"
+            "\n")
+    (let* ((errors (snowflake--parse-errors (point-min) (point-max)))
+           (end (plist-get (car errors) :end)))
+      (should (= (length errors) 1))
+      ;; Scanning again from :end finds nothing new.
+      (should-not (snowflake--parse-errors end (point-max))))))
+
+(ert-deftest snowflake-test-error-region ()
+  (with-temp-buffer
+    (insert "select 1\nfromm t;\n")
+    (let ((beg (copy-marker (point-min))))
+      ;; Line/column math lands on the whole token.
+      (let ((region (snowflake--error-region (current-buffer) beg 2 0)))
+        (should (equal (buffer-substring (car region) (cdr region))
+                       "fromm")))
+      ;; Symbol syntax: underscores belong to the token.
+      (erase-buffer)
+      (insert "select syntax_error from t;\n")
+      (let ((region (snowflake--error-region (current-buffer) beg 1 7)))
+        (should (equal (buffer-substring (car region) (cdr region))
+                       "syntax_error"))))))
+
+(ert-deftest snowflake-test-error-region-mid-line-start ()
+  ;; A region starting mid-line offsets line-1 positions by the
+  ;; marker's column.
+  (with-temp-buffer
+    (insert "select 1; select fromm t;\n")
+    (goto-char (point-min))
+    (search-forward "; ")
+    (let* ((beg (copy-marker (point)))
+           (region (snowflake--error-region (current-buffer) beg 1 7)))
+      (should (equal (buffer-substring (car region) (cdr region))
+                     "fromm")))))
+
+(ert-deftest snowflake-test-error-region-token-bounds ()
+  (with-temp-buffer
+    (insert "select ??? from t;\n")
+    (let ((beg (copy-marker (point-min))))
+      ;; Non-symbol characters still get a 1-char highlight.
+      (let ((region (snowflake--error-region (current-buffer) beg 1 7)))
+        (should (equal (buffer-substring (car region) (cdr region)) "?")))
+      ;; A position past the end of the line clamps into it.
+      (let ((region (snowflake--error-region (current-buffer) beg 1 99)))
+        (should (= (cdr region) (1- (point-max))))
+        (should (= (car region) (- (point-max) 2)))))))
+
+(ert-deftest snowflake-test-error-region-leading-trivia ()
+  ;; The CLI numbers lines from the statement's first code token, so
+  ;; blank lines and comments at the start of the sent region (e.g. a
+  ;; paragraph send) do not count.
+  (with-temp-buffer
+    (sql-mode)
+    (insert "\n-- context\nSELECT 1, ff;\n")
+    (let* ((beg (copy-marker (point-min)))
+           (region (snowflake--error-region (current-buffer) beg 1 10)))
+      (should (equal (buffer-substring (car region) (cdr region)) "ff")))
+    ;; Indentation before the statement does not count either.
+    (erase-buffer)
+    (insert "\n-- context\n  SELECT 1, ff;\n")
+    (let* ((beg (copy-marker (point-min)))
+           (region (snowflake--error-region (current-buffer) beg 1 10)))
+      (should (equal (buffer-substring (car region) (cdr region)) "ff")))
+    ;; Later lines count from the first code line as well.
+    (erase-buffer)
+    (insert "\n-- context\nSELECT 1,\nff2;\n")
+    (let* ((beg (copy-marker (point-min)))
+           (region (snowflake--error-region (current-buffer) beg 2 0)))
+      (should (equal (buffer-substring (car region) (cdr region)) "ff2")))))
+
+(ert-deftest snowflake-test-highlight-fallback-skips-trivia ()
+  ;; The whole-region fallback for errors without a location leaves
+  ;; leading blank lines and comments unhighlighted too.
+  (with-temp-buffer
+    (sql-mode)
+    (insert "\n-- context\n  select * from nope;  \n")
+    ;; The region includes leading trivia, indentation and trailing
+    ;; whitespace/newline; the overlay must not.
+    (snowflake--highlight-errors
+     (list (current-buffer)
+           (copy-marker (point-min))
+           (copy-marker (point-max) t))
+     (list (list :message "002003 (42S02): nope" :line nil :pos nil
+                 :end 1)))
+    (let ((ov (car snowflake--error-overlays)))
+      (should (equal (buffer-substring (overlay-start ov) (overlay-end ov))
+                     "select * from nope;")))))
+
+(ert-deftest snowflake-test-error-region-fallback ()
+  (with-temp-buffer
+    (insert "select 1;\n")
+    (let ((beg (copy-marker (point-min))))
+      ;; No location or one outside the buffer: nil, the caller
+      ;; highlights the whole sent region instead.
+      (should-not (snowflake--error-region (current-buffer) beg nil nil))
+      (should-not (snowflake--error-region (current-buffer) beg 99 0)))
+    (let ((dead (generate-new-buffer "snowflake-test-dead"))
+          (beg (copy-marker (point-min))))
+      (kill-buffer dead)
+      (should-not (snowflake--error-region dead beg 1 0)))))
+
+(ert-deftest snowflake-test-highlight-and-clear ()
+  (with-temp-buffer
+    (insert "select fromm t;\n")
+    (let ((src (current-buffer)))
+      (snowflake--highlight-errors
+       (list src (copy-marker (point-min)) (copy-marker (1- (point-max))))
+       (list (list :message "001003 (42000): boom" :line 1 :pos 7 :end 1)
+             (list :message "002003 (42S02): nope" :line nil :pos nil
+                   :end 1)))
+      (should (= (length snowflake--error-overlays) 2))
+      (let* ((token (cl-find 5 snowflake--error-overlays
+                             :key (lambda (ov) (- (overlay-end ov)
+                                                  (overlay-start ov)))))
+             (whole (car (remq token snowflake--error-overlays))))
+        ;; The located error sits on its token, the other one covers
+        ;; the whole sent region.
+        (should (equal (buffer-substring (overlay-start token)
+                                         (overlay-end token))
+                       "fromm"))
+        (should (eq (overlay-get token 'face) 'snowflake-error))
+        (should (equal (overlay-get token 'help-echo)
+                       "001003 (42000): boom"))
+        (should (= (overlay-start whole) (point-min)))
+        (should (= (overlay-end whole) (1- (point-max))))
+        (should (equal (overlay-get whole 'help-echo)
+                       "002003 (42S02): nope"))
+        (snowflake-clear-errors)
+        (should-not snowflake--error-overlays)
+        (should-not (overlay-buffer token))
+        (should-not (overlay-buffer whole))))))
+
+(ert-deftest snowflake-test-scan-output-marker-regression ()
+  ;; Ghostel's full redraws (e.g. on reflow) collapse the output-start
+  ;; marker backwards; the integer floor keeps rescans from reporting
+  ;; the same error twice.
+  (let ((repl (generate-new-buffer "snowflake-test-repl"))
+        (src (generate-new-buffer "snowflake-test-src")))
+    (unwind-protect
+        (progn
+          (with-current-buffer src
+            (insert "select syntax_error from t;\n"))
+          (with-current-buffer repl
+            (insert " > select syntax_error from t;\n")
+            (setq-local snowflake--error-source
+                        (list src
+                              (with-current-buffer src
+                                (copy-marker (point-min)))
+                              (with-current-buffer src
+                                (copy-marker (point-max) t))))
+            (setq-local snowflake--output-start (copy-marker (point-max)))
+            (setq-local snowflake--output-floor (point-max))
+            (insert "001003 (42000): x: SQL compilation error:\n"
+                    "syntax error line 1 at position 7 "
+                    "unexpected 'syntax_error'.\n"
+                    "\n > "))
+          (snowflake--scan-output repl)
+          (let ((overlays (buffer-local-value 'snowflake--error-overlays
+                                              src)))
+            (should (= (length overlays) 1))
+            (should (equal (with-current-buffer src
+                             (buffer-substring
+                              (overlay-start (car overlays))
+                              (overlay-end (car overlays))))
+                           "syntax_error")))
+          ;; Simulate a redraw collapsing the marker to point-min.
+          (with-current-buffer repl
+            (set-marker snowflake--output-start (point-min)))
+          (snowflake--scan-output repl)
+          (should (= (length (buffer-local-value 'snowflake--error-overlays
+                                                 src))
+                     1)))
+      (kill-buffer repl)
+      (kill-buffer src))))
+
+;;; Statement boundaries
+
+(ert-deftest snowflake-test-send-statement-at-point-min ()
+  ;; `sql-beginning-of-statement' recurses endlessly at buffer start;
+  ;; `snowflake-send-statement' must not trip over that.
+  (with-temp-buffer
+    (sql-mode)
+    (insert "select syntax_error from t;")
+    (goto-char (point-min))
+    (let (sent)
+      (cl-letf (((symbol-function 'snowflake--send)
+                 (lambda (string &rest _) (setq sent string))))
+        (snowflake-send-statement))
+      (should (equal sent "select syntax_error from t;")))))
+
 ;;; Displaying the REPL
 
 (ert-deftest snowflake-test-display-repl ()

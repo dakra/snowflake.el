@@ -6,7 +6,7 @@
 ;; URL: https://github.com/dakra/snowflake.el
 ;; Keywords: tools processes terminals sql snowflake
 ;; Version: 0.1
-;; Package-Requires: ((emacs "28.1") (ghostel "0.32"))
+;; Package-Requires: ((emacs "28.1") (ghostel "0.44"))
 
 ;; This file is not part of GNU Emacs.
 
@@ -36,6 +36,9 @@
 ;; M-x snowflake-connect starts (or switches to) a REPL for a
 ;; connection from `snow connection list'.  When the CLI exits (e.g. an
 ;; expired token), M-x snowflake-restart re-runs it in the same buffer.
+;;
+;; Errors the REPL reports for sent SQL are highlighted at their
+;; position in the source buffer (see `snowflake-highlight-errors').
 ;;
 ;; All commands are also reachable through the `snowflake' transient menu.
 
@@ -78,6 +81,32 @@ When nil, the connection marked as default by the CLI is used."
   "Whether to append a terminating \";\" to statements that lack one.
 Never applies to \"!\"-commands like !source or !queries."
   :type 'boolean)
+
+(defcustom snowflake-highlight-errors t
+  "Whether to highlight SQL errors from the REPL in the source buffer.
+Errors the REPL reports for sent SQL get a `snowflake-error'
+overlay on the offending token; errors without a usable line and
+position highlight the whole sent text.  Only applies to commands
+that send buffer text (region, paragraph, statement, line,
+buffer), not to `snowflake-send-string' or `snowflake-send-file'."
+  :type 'boolean)
+
+(defcustom snowflake-error-regexp
+  "^\\(?:Error occurred: \\)?\\([0-9]\\{6\\}\\) (\\([0-9A-Z]\\{5\\}\\)): "
+  "Regexp matching the first line of an error reported by the REPL.
+The default matches the Snowflake CLI's
+\"Error occurred: NNNNNN (SQLSTATE): \" error header (the prefix
+is optional; `snow sql -q' output omits it).  The error message
+extends from the match to the next blank line, prompt line or
+further error header."
+  :type 'regexp)
+
+(defface snowflake-error
+  '((((supports :underline (:style wave)))
+     :underline (:style wave :color "Red1"))
+    (t
+     :inherit error :underline t))
+  "Face for SQL errors reported by the REPL.")
 
 (defcustom snowflake-display-repl-buffer-function #'display-buffer
   "Function called with the REPL buffer after a send command.
@@ -150,6 +179,26 @@ buffer as a snowflake REPL.")
 
 (defvar snowflake--connections nil
   "Cached connection list, as returned by `snowflake--fetch-connections'.")
+
+(defvar-local snowflake--error-overlays nil
+  "Overlays highlighting REPL-reported SQL errors in this buffer.")
+
+(defvar-local snowflake--output-start nil
+  "Marker in a REPL buffer where the last send's output begins.
+The error scan starts here; it is advanced past errors that were
+already reported so repeated scans do not highlight them again.")
+
+(defvar-local snowflake--output-floor nil
+  "Position a REPL buffer's error scan may not start before.
+Integer twin of `snowflake--output-start': ghostel redraws the
+whole terminal as delete plus re-insert (e.g. on reflow), which
+collapses the marker backwards; the scan is clamped to this floor
+so already reported errors are not picked up again.")
+
+(defvar-local snowflake--error-source nil
+  "Source location of the last send to this REPL buffer.
+A list (BUFFER BEG-MARKER END-MARKER) describing the sent region,
+or nil when the sent text did not come from a buffer.")
 
 ;;; Connections
 
@@ -267,7 +316,8 @@ is reinitialized in place."
       (setq-local ghostel-buffer-name-function nil
                   ghostel-kill-buffer-on-exit nil
                   snowflake--connection connection)
-      (add-hook 'ghostel-exit-functions #'snowflake--on-repl-exit nil t))
+      (add-hook 'ghostel-exit-functions #'snowflake--on-repl-exit nil t)
+      (add-hook 'ghostel-output-functions #'snowflake--on-output nil t))
     buffer))
 
 ;;;###autoload
@@ -452,16 +502,25 @@ With SELECT non-nil, select its window unconditionally."
          (message "Invalid setting of `snowflake-display-repl-buffer-function'")
          (pop-to-buffer repl))))
 
-(defun snowflake--send (string &optional select)
+(defun snowflake--send (string &optional select source)
   "Send STRING to the REPL of the current buffer.
 Multi-line strings go through bracketed paste, single lines are sent
 as raw keystrokes so they enter the REPL history naturally.  SELECT
-is passed to `snowflake--display-repl'."
+is passed to `snowflake--display-repl'.  SOURCE, when non-nil, is a
+list (BUFFER BEG-MARKER END-MARKER) describing where STRING came
+from; errors the REPL reports for it are then highlighted there
+\(see `snowflake-highlight-errors')."
   (let ((repl (snowflake--ensure-repl))
         (string (snowflake--prepare-string string)))
     (when (string-empty-p string)
       (user-error "Nothing to send"))
+    (snowflake-clear-errors)
     (with-current-buffer repl
+      (setq snowflake--error-source (and snowflake-highlight-errors source))
+      (when snowflake--error-source
+        (let ((output-start (or (ghostel-cursor-point) (point-max))))
+          (setq snowflake--output-start (copy-marker output-start)
+                snowflake--output-floor output-start)))
       (if (string-search "\n" string)
           (progn (ghostel-paste-string string)
                  (ghostel-send-string "\r"))
@@ -471,9 +530,14 @@ is passed to `snowflake--display-repl'."
 
 (defun snowflake-send-region (start end &optional select)
   "Send the region between START and END to the REPL.
-With prefix argument SELECT, also select the REPL window."
+With prefix argument SELECT, also select the REPL window.  Errors
+the REPL reports for the sent SQL are highlighted at their position
+in this buffer (see `snowflake-highlight-errors')."
   (interactive "r\nP")
-  (snowflake--send (buffer-substring-no-properties start end) select))
+  (snowflake--send (buffer-substring-no-properties start end) select
+                   (list (current-buffer)
+                         (copy-marker start)
+                         (copy-marker end t))))
 
 (defun snowflake-send-paragraph (&optional select)
   "Send the paragraph around point to the REPL.
@@ -504,6 +568,11 @@ the REPL window."
   (interactive "P")
   (let (start end)
     (save-excursion
+      ;; `sql-beginning-of-statement' recurses endlessly when called
+      ;; at the very beginning of the buffer; no statement can begin
+      ;; before the next character either way.
+      (when (and (bobp) (not (eobp)))
+        (forward-char 1))
       (sql-beginning-of-statement 1)
       (setq start (point))
       (sql-end-of-statement 1)
@@ -516,7 +585,10 @@ With prefix argument SELECT, also select the REPL window."
   (interactive "P")
   (snowflake--send (buffer-substring-no-properties
                     (line-beginning-position) (line-end-position))
-                   select)
+                   select
+                   (list (current-buffer)
+                         (copy-marker (line-beginning-position))
+                         (copy-marker (line-end-position) t)))
   (forward-line 1)
   (while (and (not (eobp)) (looking-at-p "[[:space:]]*$"))
     (forward-line 1))
@@ -560,6 +632,174 @@ Lisp; interactively the prefix argument selects the file instead."
         (copy-file file tmp t)
         (setq file tmp)))
     (snowflake--send (format "!source %s" file) select)))
+
+;;; Error detection
+
+(defun snowflake--parse-errors (beg end)
+  "Return SQL errors reported between BEG and END in the current buffer.
+An error starts at a line matching `snowflake-error-regexp' and
+extends to the next blank line, prompt line or error header; an
+error still missing such a terminator (more output pending) is not
+returned.  Each error is a plist with :message (the full error
+text, with ghostel's soft line wraps removed), :line and :pos (the
+1-based line and 0-based position of a
+\"line L at position P\" location in the message, both nil when it
+carries none) and :end (the buffer position after the error, for
+advancing the scan start)."
+  (let (errors)
+    (save-excursion
+      (goto-char beg)
+      (while (re-search-forward snowflake-error-regexp end t)
+        (let ((start (match-beginning 0))
+              (msg-end nil))
+          (forward-line 1)
+          (while (and (not msg-end) (< (point) end))
+            ;; A line continuing a soft-wrapped one is message text,
+            ;; never a terminator.
+            (if (and (not (and (> (point) beg)
+                               (get-text-property (1- (point))
+                                                  'ghostel-wrap)))
+                     (or (looking-at-p "[[:space:]]*$")
+                         (looking-at-p "[[:space:]]*>")
+                         (looking-at-p snowflake-error-regexp)))
+                (setq msg-end (point))
+              (forward-line 1)))
+          (if (not msg-end)
+              (goto-char end)
+            ;; The terminal hard-wraps long error lines at the window
+            ;; width, possibly splitting the location mid-number.
+            ;; Ghostel marks such newlines with the `ghostel-wrap'
+            ;; property; filtering them restores the CLI's logical
+            ;; lines, so the message must be extracted with its text
+            ;; properties.
+            (let* ((msg (substring-no-properties
+                         (string-trim
+                          (ghostel--clean-copy-text
+                           (buffer-substring start msg-end)))))
+                   (located (string-match
+                             "line \\([0-9]+\\) at position \\([0-9]+\\)"
+                             msg)))
+              (push (list :message msg
+                          :line (and located
+                                     (string-to-number
+                                      (match-string 1 msg)))
+                          :pos (and located
+                                    (string-to-number
+                                     (match-string 2 msg)))
+                          :end msg-end)
+                    errors))
+            (goto-char msg-end)))))
+    (nreverse errors)))
+
+(defun snowflake--code-start (position)
+  "Return the first position at or after POSITION holding code.
+Skips whitespace and comments in the current buffer, mirroring how
+the CLI strips leading trivia off a statement before numbering its
+lines."
+  (save-excursion
+    (goto-char position)
+    (forward-comment (buffer-size))
+    (point)))
+
+(defun snowflake--error-region (src beg-marker line pos)
+  "Return the bounds of an error token in SRC as a cons (START . END).
+LINE (1-based) and POS (0-based) locate the error relative to the
+first code character of the SQL sent from SRC starting at
+BEG-MARKER (leading whitespace and comments do not count, matching
+the CLI's \"line L at position P\" numbering).  The region covers
+the symbol at that spot, at least one character.  Returns nil when
+LINE or POS is nil or does not map into SRC; callers then fall
+back to highlighting the whole sent region."
+  (when (and line pos
+             (buffer-live-p src)
+             (eq (marker-buffer beg-marker) src))
+    (with-current-buffer src
+      (save-excursion
+        (goto-char (snowflake--code-start beg-marker))
+        (when (or (= line 1)
+                  (zerop (forward-line (1- line))))
+          (let ((start (min (+ (point) pos) (line-end-position))))
+            (goto-char start)
+            (skip-syntax-forward "w_" (line-end-position))
+            (cond ((> (point) start) (cons start (point)))
+                  ((< start (line-end-position)) (cons start (1+ start)))
+                  ((> start (line-beginning-position))
+                   (cons (1- start) start))
+                  (t nil))))))))
+
+(defun snowflake--highlight-errors (source errors)
+  "Highlight ERRORS from the REPL in the buffer described by SOURCE.
+SOURCE is a list (BUFFER BEG-MARKER END-MARKER) of the sent
+region.  Each error gets a `snowflake-error' overlay on the token
+its line and position point at, or on the whole sent region when
+it carries no usable location.  Every error message is also shown
+via `message'."
+  (pcase-let ((`(,src ,beg ,end) source))
+    (when (and (buffer-live-p src)
+               (eq (marker-buffer beg) src)
+               (eq (marker-buffer end) src))
+      (with-current-buffer src
+        (dolist (err errors)
+          (let ((region (snowflake--error-region src beg
+                                                 (plist-get err :line)
+                                                 (plist-get err :pos))))
+            (when (or (null region) (>= (car region) end))
+              ;; Leading whitespace and comments are not part of the
+              ;; failed statement; keep them (and trailing
+              ;; whitespace) out of the highlight.
+              (let* ((first (marker-position beg))
+                     (last (marker-position end))
+                     (code (snowflake--code-start first)))
+                (when (< code last)
+                  (setq first code))
+                (save-excursion
+                  (goto-char last)
+                  (skip-chars-backward " \t\n" first)
+                  (when (> (point) first)
+                    (setq last (point))))
+                (setq region (cons first last))))
+            (when (< (car region) (cdr region))
+              (let ((ov (make-overlay (car region) (cdr region))))
+                (overlay-put ov 'face 'snowflake-error)
+                (overlay-put ov 'help-echo (plist-get err :message))
+                (overlay-put ov 'evaporate t)
+                (push ov snowflake--error-overlays)))
+            (message "%s" (plist-get err :message))))))))
+
+(defun snowflake--scan-output (buffer)
+  "Scan REPL BUFFER for errors in the output of the last send.
+New errors are highlighted in the send's source buffer and
+`snowflake--output-start' is advanced past them."
+  (when (and snowflake-highlight-errors
+             (buffer-live-p buffer))
+    (with-current-buffer buffer
+      (when (and snowflake--error-source
+                 (markerp snowflake--output-start)
+                 (marker-position snowflake--output-start))
+        (let* ((start (min (point-max)
+                           (max (marker-position snowflake--output-start)
+                                (or snowflake--output-floor (point-min)))))
+               (errors (snowflake--parse-errors start (point-max))))
+          (when errors
+            (let ((done (apply #'max (mapcar (lambda (err)
+                                               (plist-get err :end))
+                                             errors))))
+              (set-marker snowflake--output-start done)
+              (setq snowflake--output-floor done))
+            (snowflake--highlight-errors snowflake--error-source errors)))))))
+
+(defun snowflake--on-output (buffer)
+  "Schedule an error scan of REPL BUFFER's new output.
+Meant for `ghostel-output-functions'; the scan runs from a timer
+since hook functions must stay light in the render path."
+  (when snowflake--error-source
+    (run-at-time 0 nil #'snowflake--scan-output buffer)))
+
+(defun snowflake-clear-errors ()
+  "Remove all REPL error highlights from the current buffer."
+  (interactive)
+  (mapc #'delete-overlay snowflake--error-overlays)
+  (setq snowflake--error-overlays nil))
 
 ;;; REPL interaction from the SQL buffer
 
@@ -988,6 +1228,7 @@ qualifier only that schema's objects are offered."
     (define-key map (kbd "C-c C-z") #'snowflake-switch-to-repl)
     (define-key map (kbd "C-c C-j") #'snowflake-set-buffer)
     (define-key map (kbd "C-c C-k") #'snowflake-interrupt)
+    (define-key map (kbd "C-c C-l") #'snowflake-clear-errors)
     map)
   "Keymap for `snowflake-minor-mode'.
 Shadows the comint-oriented sql.el bindings.")
@@ -1046,6 +1287,7 @@ enabled (see `snowflake-set-sql-product' for the details)."
    ["REPL"
     ("z" "Switch to REPL" snowflake-switch-to-repl)
     ("k" "Interrupt" snowflake-interrupt)
+    ("l" "Clear error highlights" snowflake-clear-errors)
     ("R" "Restart" snowflake-restart)]])
 
 (provide 'snowflake)

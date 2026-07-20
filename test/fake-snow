@@ -30,6 +30,33 @@ if [ "$1" = "sql" ]; then
         if [ "$1" = "-q" ]; then query="$2"; shift; fi
         shift
     done
+    if [ -z "$query" ]; then
+        # Interactive REPL mode: reads statements from stdin; input
+        # mentioning syntax_error gets a canned compilation error.
+        printf ' > '
+        while IFS= read -r line; do
+            case "$line" in
+                exit|quit|*!exit*|*!quit*)
+                    exit 0
+                    ;;
+                *syntax_error*)
+                    # Same shape as the real CLI: blank line after the
+                    # echoed input, prefixed header, no blank line
+                    # before the next prompt.
+                    echo ""
+                    echo "Error occurred: 001003 (42000): 01b2f927-0000-0000-0000-000000000000: SQL compilation error:"
+                    echo "syntax error line 1 at position 7 unexpected 'syntax_error'."
+                    ;;
+                "")
+                    ;;
+                *)
+                    echo "OK"
+                    ;;
+            esac
+            printf ' > '
+        done
+        exit 0
+    fi
     case "$query" in
         *"show terse schemas"*)
             cat <<'EOF'
