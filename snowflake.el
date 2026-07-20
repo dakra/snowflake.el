@@ -33,12 +33,11 @@
 ;; Enable `snowflake-minor-mode' in a `sql-mode' buffer and send the
 ;; region (C-c C-r), paragraph (C-c C-c), statement (C-c C-e), line
 ;; (C-c C-n) or whole buffer (C-c C-b) to a linked REPL buffer.
-;; M-x snowflake starts (or switches to) a REPL for a connection from
-;; `snow connection list'.  When the CLI exits (e.g. an expired
-;; token), M-x snowflake-restart re-runs it in the same buffer.
+;; M-x snowflake-connect starts (or switches to) a REPL for a
+;; connection from `snow connection list'.  When the CLI exits (e.g. an
+;; expired token), M-x snowflake-restart re-runs it in the same buffer.
 ;;
-;; All commands are also reachable through the `snowflake-dispatch'
-;; transient menu.
+;; All commands are also reachable through the `snowflake' transient menu.
 
 ;;; Code:
 
@@ -272,7 +271,7 @@ is reinitialized in place."
     buffer))
 
 ;;;###autoload
-(defun snowflake (connection)
+(defun snowflake-connect (connection)
   "Switch to a Snowflake REPL for CONNECTION, starting it if needed.
 CONNECTION nil or \"\" means the CLI default connection.
 Interactively, prompt for the connection; with a prefix argument,
@@ -292,9 +291,6 @@ buffer, link that buffer to the REPL and enable
         (snowflake-minor-mode 1)
         (snowflake--link-buffer buffer)))
     (pop-to-buffer buffer)))
-
-;;;###autoload
-(defalias 'snowflake-connect #'snowflake)
 
 (defun snowflake-restart (&optional buffer)
   "Restart the `snow sql' process of REPL BUFFER in place.
@@ -1031,11 +1027,11 @@ enabled (see `snowflake-set-sql-product' for the details)."
 
 ;;; Transient
 
-;;;###autoload (autoload 'snowflake-dispatch "snowflake" nil t)
-(transient-define-prefix snowflake-dispatch ()
+;;;###autoload (autoload 'snowflake "snowflake" nil t)
+(transient-define-prefix snowflake ()
   "Snowflake REPL commands."
   [["Connection"
-    ("c" "Connect" snowflake)
+    ("c" "Connect" snowflake-connect)
     ("j" "Set REPL buffer" snowflake-set-buffer)
     ("g" "Refresh connections" snowflake-refresh-connections)
     ("o" "Refresh completions" snowflake-refresh-completions)]

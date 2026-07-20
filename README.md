@@ -11,10 +11,10 @@ formatting all work natively.
 
 ## Features
 
-- `M-x snowflake` starts (or switches to) a REPL for any connection
-  from `snow connection list`, one REPL buffer per connection.  Called
-  from a `sql-mode` buffer it links that buffer to the REPL and
-  enables `snowflake-minor-mode` in it.
+- `M-x snowflake-connect` starts (or switches to) a REPL for any
+  connection from `snow connection list`, one REPL buffer per
+  connection.  Called from a `sql-mode` buffer it links that buffer to
+  the REPL and enables `snowflake-minor-mode` in it.
 - `snowflake-minor-mode` on top of `sql-mode` sends region, paragraph,
   statement, line, buffer or file to the linked REPL.
 - Registers a `snowflake` sql.el product: `SQL[Snowflake]` mode line
@@ -36,7 +36,7 @@ formatting all work natively.
   keystrokes so they enter the REPL history naturally.
 - `M-x snowflake-restart` re-runs `snow sql` in the same buffer after
   the CLI exits, e.g. when an auth token expired.
-- `M-x snowflake-dispatch` transient menu with all commands.
+- `M-x snowflake` transient menu with all commands.
 
 ## Installation
 
@@ -76,9 +76,9 @@ contract as `sql-display-sqli-buffer-function`).
 `snowflake-display-unless-visible` displays the REPL only when it is
 not already shown on some frame, e.g. on another monitor.
 
-Unbound commands: `snowflake` (alias `snowflake-connect`),
-`snowflake-restart`, `snowflake-refresh-connections`,
-`snowflake-refresh-completions`, `snowflake-dispatch`.
+Unbound commands: `snowflake-connect`, `snowflake-restart`,
+`snowflake-refresh-connections`, `snowflake-refresh-completions`,
+`snowflake` (transient menu).
 
 ## Configuration
 
